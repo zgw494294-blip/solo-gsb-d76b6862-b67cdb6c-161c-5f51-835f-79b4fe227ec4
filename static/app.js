@@ -55,11 +55,21 @@ const STATUS_TEXT = {
 
 let runId = null;        // run id of the run this page is driving
 let pauseSeq = 0;        // pause sequence number of the latest (live) pause
+let runGen = 0;          // 归属代号：仅在“获准启动”的新运行接管页面时 +1
+let pollOrder = 0;       // 本运行内已发起轮询的序号（同一运行内丢弃迟到响应）
+let lastPollApplied = 0; // 本运行内已采纳的最大轮询序号
 let pollTimer = null;
 let liveState = null;    // latest /api/state snapshot for runId
 let pauses = [];         // pause snapshots returned by /api/pauses (asc seq)
 let viewingSeq = null;   // selected historical pause_seq, or null = live view
 let historySig = "";     // dropdown contents signature, to avoid rebuilding
+
+// 异步链在每个 await 之后都要重新核对归属：旧运行的轮询/控制响应即使在请求
+// 发出时仍然匹配，获准重跑后返回也必须整条丢弃（不渲染、不写历史、不动轮询
+// 与按钮、不解除源码只读、不发提示）。
+function runStale(gen) {
+  return gen !== runGen;
+}
 
 function inHistoryMode() {
   return viewingSeq !== null;
@@ -111,18 +121,24 @@ async function postJSON(url, body) {
 }
 
 async function startRun() {
-  showMessage("");
+  const gen = runGen;  // 响应返回期间若有新运行获准，本次结果一律作废
   const { ok, data } = await postJSON("/api/run", { code: $("code").value });
+  if (runStale(gen)) return;
   if (!ok) {
     // 启动被拒绝（如活动运行冲突）：不清空既有停顿，也不切走当前视图
     showMessage(data.error || "启动失败");
     return;
   }
+  // 只有获准启动才切换归属并清空上一个运行的历史；此后所有旧异步链失效
+  runGen += 1;
   runId = data.run_id;
   pauseSeq = 0;
   liveState = null;
   pauses = [];
+  pollOrder = 0;
+  lastPollApplied = 0;
   historySig = null;  // 强制下次重建下拉框，清掉上一个运行的停顿条目
+  showMessage("");
   exitHistoryView();
   populateHistory();
   setRunningUI(true);
@@ -130,6 +146,7 @@ async function startRun() {
 }
 
 async function control(kind) {
+  const gen = runGen;
   if (!runId || inHistoryMode()) return;  // 历史模式禁用步进/继续
   // 同一次停顿只发一次；服务端也会拒绝重复/过期请求
   $("btn-step").disabled = true;
@@ -138,17 +155,24 @@ async function control(kind) {
     run_id: runId,
     pause_seq: pauseSeq,  // 始终用实时 pause_seq，绝不用历史序号推进
   });
+  // 重跑获准后才返回的旧控制响应：不写提示、不刷新新运行
+  if (runStale(gen)) return;
   if (!ok) {
     showMessage(data.error || "请求被拒绝");
   } else {
     showMessage("");
   }
-  setTimeout(poll, 60);
+  setTimeout(() => {
+    if (!runStale(gen)) poll();
+  }, 60);
 }
 
 async function terminateRun() {
+  const gen = runGen;
   if (!runId) return;  // 历史模式下仍作用于当前运行
   const { ok, data } = await postJSON("/api/terminate", { run_id: runId });
+  // 旧终止请求的成功/失败都不得改动新运行（状态、提示、轮询、按钮）
+  if (runStale(gen)) return;
   if (!ok) showMessage(data.error || "终止失败");
   poll();
 }
@@ -166,6 +190,8 @@ async function fetchPauses() {
 
 async function poll() {
   if (!runId) return;
+  const gen = runGen;
+  const seq = ++pollOrder;  // 同一运行内可能并行多个轮询，按发起顺序采纳
   let data;
   try {
     const res = await fetch("/api/state");
@@ -173,13 +199,20 @@ async function poll() {
   } catch (e) {
     return;
   }
-  // 旧运行的迟到响应不得覆盖新运行：run_id 不匹配直接丢弃
-  if (data.run_id !== runId) return;
+  // 旧运行的迟到状态响应不得覆盖新运行：归属已切换，或同一运行内已有更新
+  // 的轮询先行返回时，本次结果整条丢弃（不渲染、不查停顿、不动轮询/按钮）。
+  if (runStale(gen) || data.run_id !== runId) return;
+
+  const latest = await fetchPauses();
+  // /api/pauses 等待期间可能正好获准重跑：旧运行的历史（即使服务端已生成
+  // 200）也不得写入新运行；同运行内被更新轮询抢先时同样放弃。
+  if (runStale(gen) || seq < lastPollApplied) return;
+
+  lastPollApplied = seq;
   liveState = data;
   pauseSeq = data.pause_seq;
   renderStatusBadge(data.status);
 
-  const latest = await fetchPauses();
   if (latest) pauses = latest;
   populateHistory();
 
@@ -197,7 +230,8 @@ async function poll() {
   }
 
   if (["finished", "exception", "terminated"].includes(data.status)) {
-    // 结束/异常/终止后停止轮询，但历史停顿仍可回看
+    // 结束/异常/终止后停止轮询，但历史停顿仍可回看。只有当前运行的终态轮
+    // 询才能停止轮询/改动按钮；旧运行的收尾响应已在上面被丢弃。
     stopPolling();
     setRunningUI(false);
     // 终态后若停在历史视图，保持其控制禁用状态
