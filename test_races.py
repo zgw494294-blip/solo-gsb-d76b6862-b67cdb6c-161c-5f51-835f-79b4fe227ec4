@@ -20,6 +20,8 @@ Covers:
 
 import json
 import os
+import shutil
+import subprocess
 import threading
 import time
 import unittest
@@ -819,6 +821,558 @@ class RaceTests(unittest.TestCase):
                 self.assertEqual(res.get_json()["pauses"], [])
             finally:
                 appmod.CURRENT = None
+
+
+class DelayedResponseTests(unittest.TestCase):
+    """Cross-run async chain: old in-flight replies delayed across the
+    admission of a new run.
+
+    The browser keeps two overlapping poll chains per run and each chain
+    issues /api/state plus /api/pauses; control endpoints (step/continue/
+    terminate) and even rejected /api/run replies can also be in flight when
+    a new run is admitted. The server's job in this contract is:
+
+      * produce every reply (payload AND status code) under COND and finish
+        serialising it outside the lock, so a reply that is *already built*
+        (in particular a 200 with the old run's pauses) can be held back and
+        delivered arbitrarily late without blocking admission or any other
+        request;
+      * self-describe every payload with the run it belongs to: the delayed
+        old state/pauses 200 must still carry the OLD run_id (the frontend
+        drops it instead of writing old history/state into the new run), and
+        the old run_id is 409 for pauses/controls once the new run is
+        admitted;
+      * change nothing about the new run while the old reply is parked: its
+        status/pauses/lifecycle advance normally and its slot is not
+        blocked.
+    """
+
+    def setUp(self):
+        self.client = appmod.app.test_client()
+        self.created = []
+        self._real_popen = appmod.subprocess.Popen
+
+        def tracking_popen(*args, **kwargs):
+            proc = self._real_popen(*args, **kwargs)
+            self.created.append(proc)
+            return proc
+
+        self._patch = mock.patch.object(appmod.subprocess, "Popen", tracking_popen)
+        self._patch.start()
+        with appmod.COND:
+            appmod.CURRENT = None
+
+    def tearDown(self):
+        self._patch.stop()
+        with appmod.COND:
+            current = appmod.CURRENT
+        if (current is not None and current.status in appmod.ACTIVE_STATES
+                and current.proc_started):
+            self.client.post("/api/terminate", json={"run_id": current.run_id})
+        for proc in self.created:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+    def state(self):
+        return self.client.get("/api/state").get_json()
+
+    def start_run(self, code=SIMPLE_CODE):
+        res = self.client.post("/api/run", json={"code": code})
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        return res.get_json()["run_id"]
+
+    def wait_paused(self, run_id):
+        ok = wait_for(lambda: self.state()["status"] == "paused")
+        self.assertTrue(ok, f"run {run_id} never paused: {self.state()}")
+
+    def cleanup_run(self, run_id):
+        proc = appmod.CURRENT.proc
+        res = self.client.post("/api/terminate", json={"run_id": run_id})
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        self.assertIsNotNone(proc.poll(), "child not reaped")
+
+    def gated_jsonify(self, gates):
+        """Patch flask.jsonify (the same symbol app.py imported) so that,
+        while a path's gate is armed AND its one-shot window is open, the
+        matching response blocks until released. Arming opens a window that
+        captures exactly one request; the captured request parks until
+        release is set, then the gate auto-disarms and resets so the test
+        may re-arm to park the next response. The response object is fully
+        built before blocking and the COND lock has already been released,
+        so a parked reply cannot stall run lifecycle transitions. `gates`
+        maps path -> {"armed", "window_open", "entered", "release",
+        "vacated"} events."""
+        real_jsonify = appmod.jsonify
+        lock = threading.Lock()
+
+        def fake_jsonify(*args, **kwargs):
+            response = real_jsonify(*args, **kwargs)
+            path = appmod.request.path
+            gate = gates.get(path)
+            if gate is None:
+                return response
+            # Capture the gate object under the lock: a re-arm replaces the
+            # mapping with a fresh generation, so this request keeps parking
+            # on / releasing its own gate no matter what the test does next.
+            with lock:
+                should_park = (gate["armed"].is_set()
+                               and gate["window_open"].is_set())
+                if should_park:
+                    gate["window_open"].clear()  # one request per arming
+                    gate["entered"].set()
+            if not should_park:
+                return response
+            # Plain wait: assertions must never run in worker threads (a
+            # failure there would surface as an unrelated HTTP 500). The
+            # test thread checks timing via wait_entered/release.
+            gate["release"].wait(timeout=30)
+            # Vacate BEFORE clearing armed: re-arm waits on vacated, so it
+            # must never observe a vacated previous gate that still looks
+            # armed (two generations coexisting would lose a release).
+            gate["vacated"].set()
+            gate["armed"].clear()
+            return response
+
+        return mock.patch.object(appmod, "jsonify", fake_jsonify)
+
+    def call_in_thread(self, client, method, path, gate_key, gates,
+                       json_body=None):
+        """Perform one request in a thread and store its result."""
+        result = {}
+
+        def do():
+            if method == "GET":
+                res = client.get(path)
+            else:
+                res = client.post(path, json=json_body)
+            result["status"] = res.status_code
+            result["body"] = res.get_json()
+
+        t = threading.Thread(target=do)
+        t.start()
+        return t, result
+
+    def _new_gate(self):
+        return {
+            "armed": threading.Event(),
+            "window_open": threading.Event(),
+            "release": threading.Event(),
+            "entered": threading.Event(),
+            "vacated": threading.Event(),
+        }
+
+    def _make_gates(self, paths):
+        gates = {}
+        for path in paths:
+            gate = self._new_gate()
+            gate["vacated"].set()  # initial generation: nothing in flight
+            gates[path] = gate
+        return gates
+
+    def arm(self, gates, path):
+        """Arm the gate and open the one-shot capture window. Every arming
+        installs FRESH events in the mapping: a request already parked on
+        a previous generation keeps referencing its own gate object, so
+        later generations can never erase its release signal. Arming waits
+        for the previous generation's worker to vacate (it was released),
+        keeping generations strictly serial; arming while the current
+        generation is still parked is a test bug."""
+        old = gates[path]
+        self.assertTrue(old["vacated"].wait(10),
+                        f"previous gate for {path} never vacated before re-arm")
+        if old["armed"].is_set():
+            raise RuntimeError(f"gate for {path} re-armed while still parked")
+        gate = self._new_gate()
+        gate["window_open"].set()
+        gate["armed"].set()
+        gates[path] = gate
+
+    def wait_entered(self, gates, path):
+        self.assertTrue(gates[path]["entered"].wait(10),
+                        f"gate for {path} never entered")
+        # The request is now parked; test-side calls with the same path are
+        # no longer captured (the one-shot window closed on entry).
+
+    def release(self, gates, path):
+        """Release the parked request of the current generation and wait
+        until its worker vacated. The gate is captured before signalling:
+        a later re-arm replaces the mapping, but releasing must act on the
+        generation that was actually parked."""
+        gate = gates[path]
+        gate["release"].set()
+        self.assertTrue(gate["vacated"].wait(10),
+                        f"gate for {path} never vacated after release")
+
+    # ---- delayed old /api/state reply crossing a new admission ----------
+
+    def test_delayed_old_state_reply_cannot_touch_new_run(self):
+        old_id = self.start_run()
+        self.wait_paused(old_id)
+
+        gates = self._make_gates(["/api/state"])
+        client = appmod.app.test_client()
+        with self.gated_jsonify(gates):
+            self.arm(gates, "/api/state")
+            t, result = self.call_in_thread(
+                client, "GET", "/api/state", "/api/state", gates)
+            # The state reply (200, old run) is built and parked.
+            self.wait_entered(gates, "/api/state")
+
+            # While that reply is in flight the old run is terminated and a
+            # new run admitted: admission must not block on the parked reply.
+            self.assertEqual(
+                self.client.post("/api/terminate",
+                                 json={"run_id": old_id}).status_code, 200)
+            new_id = self.start_run()
+            self.assertNotEqual(new_id, old_id)
+            self.wait_paused(new_id)
+
+            # The new run is fully usable while the old reply is still held.
+            # (Gate is single-shot and already consumed by the parked reply,
+            # so further /api/state calls pass straight through.)
+            snap = self.state()
+            self.assertEqual(snap["run_id"], new_id)
+            self.assertEqual(snap["status"], "paused")
+            self.assertEqual(snap["pause_seq"], 1)
+
+            self.release(gates, "/api/state")
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+
+        # The delayed reply still describes the OLD run as it was when the
+        # response was BUILT (paused, before terminate landed): the frontend
+        # drops it solely via run_id, so neither this stale paused state nor
+        # the old run's later terminal state can ever flip the new run's UI
+        # or stop its polling.
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["body"]["run_id"], old_id)
+        self.assertIn(result["body"]["status"], ("paused", "terminated"))
+
+        # The new run kept advancing while/after the old reply landed.
+        snap = self.state()
+        self.assertEqual(snap["run_id"], new_id)
+        self.assertEqual(snap["status"], "paused")
+        self.cleanup_run(new_id)
+
+    # ---- the headline chain: two old poll chains in parallel, one parked
+    #      on a 200 pauses reply, both landing after the new run is admitted
+
+    def test_parallel_old_poll_chains_delayed_across_admission(self):
+        old_id = self.start_run()
+        self.wait_paused(old_id)
+        old_pauses = self.client.get(
+            f"/api/pauses?run_id={old_id}").get_json()["pauses"]
+        self.assertEqual(len(old_pauses), 1)
+
+        gates = self._make_gates(
+            ["/api/state", "/api/pauses", "/api/terminate"])
+        client_a = appmod.app.test_client()
+        client_b = appmod.app.test_client()
+        client_term = appmod.app.test_client()
+        with self.gated_jsonify(gates):
+            # Poll chain A: its pauses follow-up is answered 200 while the
+            # old run is still around, and that reply is held back.
+            self.arm(gates, "/api/pauses")
+            ta, ra = self.call_in_thread(
+                client_a, "GET", f"/api/pauses?run_id={old_id}",
+                "/api/pauses", gates)
+            self.wait_entered(gates, "/api/pauses")
+
+            # The old run reaches a terminal state; the terminate SUCCESS
+            # reply is itself parked so chain B can observe "terminated"
+            # while the terminal transition is committed but no terminate
+            # response has been processed by the browser yet.
+            self.arm(gates, "/api/terminate")
+            tt, rt = self.call_in_thread(
+                client_term, "POST", "/api/terminate", "/api/terminate",
+                gates, json_body={"run_id": old_id})
+            self.wait_entered(gates, "/api/terminate")
+            self.assertEqual(appmod.CURRENT.status, "terminated")
+            self.assertTrue(appmod.CURRENT.reaped)
+
+            # Poll chain B now queries state: it gets the terminal state
+            # (200) and that reply is held back across the admission.
+            self.arm(gates, "/api/state")
+            tb, rb = self.call_in_thread(
+                client_b, "GET", "/api/state", "/api/state", gates)
+            self.wait_entered(gates, "/api/state")
+
+            # The user's new run is admitted while all three old replies
+            # (terminate success, terminal state, old pauses 200) are in
+            # flight.
+            new_id = self.start_run()
+            self.assertNotEqual(new_id, old_id)
+            self.wait_paused(new_id)
+
+            # New run's live view is healthy while the old replies park.
+            self.assertEqual(self.state()["run_id"], new_id)
+
+            # Exact ordering from the bug report: B completes first (its
+            # terminal-state reply lands), the parked terminate success
+            # resolves, then A's pauses reply returns.
+            self.release(gates, "/api/state")
+            tb.join(timeout=10)
+            self.release(gates, "/api/terminate")
+            tt.join(timeout=10)
+            self.release(gates, "/api/pauses")
+            ta.join(timeout=10)
+            self.assertFalse(
+                ta.is_alive() or tb.is_alive() or tt.is_alive())
+
+        # All delayed replies self-describe the OLD run. The frontend
+        # run_id guards must drop all of them: the old pause list must never
+        # populate the new run's dropdown and the old terminal state / old
+        # terminate success must never stop the new polling or flip buttons.
+        self.assertEqual(rt["status"], 200)
+        self.assertEqual(rt["body"], {"ok": True, "status": "terminated"})
+
+        self.assertEqual(ra["status"], 200)
+        self.assertEqual(ra["body"]["run_id"], old_id)
+        self.assertEqual(
+            [q["pause_seq"] for q in ra["body"]["pauses"]],
+            [q["pause_seq"] for q in old_pauses])
+
+        self.assertEqual(rb["status"], 200)
+        self.assertEqual(rb["body"]["run_id"], old_id)
+        self.assertEqual(rb["body"]["status"], "terminated")
+
+        # The new run's history is independent and still starts at seq 1;
+        # old snapshots were never copied into it.
+        new_pauses = self.client.get(
+            f"/api/pauses?run_id={new_id}").get_json()["pauses"]
+        self.assertEqual([q["pause_seq"] for q in new_pauses], [1])
+        snap = self.state()
+        self.assertEqual(snap["run_id"], new_id)
+        self.assertEqual(snap["status"], "paused")
+        self.cleanup_run(new_id)
+
+    # ---- old control replies (409 and 200) delayed across admission -----
+
+    def test_delayed_old_step_reply_does_not_touch_new_run(self):
+        old_id = self.start_run()
+        self.wait_paused(old_id)
+        seq = self.state()["pause_seq"]
+        self.assertEqual(seq, 1)
+
+        gates = self._make_gates(["/api/step"])
+        client = appmod.app.test_client()
+        with self.gated_jsonify(gates):
+            # The accepted step (200) consumes pause #1.
+            accepted = self.client.post(
+                "/api/step", json={"run_id": old_id, "pause_seq": seq})
+            self.assertEqual(accepted.status_code, 200)
+            self.assertTrue(wait_for(
+                lambda: self.state()["pause_seq"] == 2
+                and self.state()["status"] == "paused"))
+
+            # A duplicate for the already consumed pause yields 409; hold
+            # that failure reply back across the new-run admission.
+            self.arm(gates, "/api/step")
+            t, result = self.call_in_thread(
+                client, "POST", "/api/step", "/api/step", gates,
+                json_body={"run_id": old_id, "pause_seq": seq})
+            self.wait_entered(gates, "/api/step")
+
+            self.assertEqual(
+                self.client.post(
+                    "/api/terminate", json={"run_id": old_id}).status_code, 200)
+            new_id = self.start_run()
+            self.wait_paused(new_id)
+
+            self.release(gates, "/api/step")
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual(result["status"], 409)
+        self.assertEqual(self.state()["run_id"], new_id)
+        self.assertEqual(self.state()["status"], "paused")
+        self.cleanup_run(new_id)
+
+    def test_delayed_old_terminate_success_reply_does_not_touch_new_run(self):
+        old_id = self.start_run()
+        self.wait_paused(old_id)
+
+        gates = self._make_gates(["/api/terminate"])
+        client = appmod.app.test_client()
+        with self.gated_jsonify(gates):
+            # A valid terminate: 200 {ok, status} is built (child killed and
+            # reaped) but the reply lands only after the new run is admitted.
+            self.arm(gates, "/api/terminate")
+            t, result = self.call_in_thread(
+                client, "POST", "/api/terminate", "/api/terminate", gates,
+                json_body={"run_id": old_id})
+            self.wait_entered(gates, "/api/terminate")
+
+            # The success guarantee still holds while the reply is parked:
+            # the child is dead and reaped, so the new run is admitted at
+            # once.
+            new_id = self.start_run()
+            self.assertNotEqual(new_id, old_id)
+            self.wait_paused(new_id)
+
+            self.release(gates, "/api/terminate")
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["body"], {"ok": True, "status": "terminated"})
+        # The old terminate's success response must not flip the new run's
+        # UI: it is still paused and its terminate is still available.
+        snap = self.state()
+        self.assertEqual(snap["run_id"], new_id)
+        self.assertEqual(snap["status"], "paused")
+        self.cleanup_run(new_id)
+
+    # ---- old pauses 200 (built pre-admission) and 409 (post-admission)
+    #      both delayed, plus a rejected run reply -----------------------
+
+    def test_delayed_pauses_200_then_expired_409_and_rejected_run_view(self):
+        old_id = self.start_run()
+        self.wait_paused(old_id)
+        old_pauses = self.client.get(
+            f"/api/pauses?run_id={old_id}").get_json()["pauses"]
+        self.assertEqual(
+            self.client.post(
+                "/api/terminate", json={"run_id": old_id}).status_code, 200)
+
+        gates = self._make_gates(["/api/pauses", "/api/run"])
+        client = appmod.app.test_client()
+        with self.gated_jsonify(gates):
+            # Old id is still current (terminal) when this request runs: a
+            # 200 with the old history is BUILT before admission and held
+            # back across it -- the frontend bug path.
+            self.arm(gates, "/api/pauses")
+            t_old200, r_old200 = self.call_in_thread(
+                client, "GET", f"/api/pauses?run_id={old_id}",
+                "/api/pauses", gates)
+            self.wait_entered(gates, "/api/pauses")
+
+            new_id = self.start_run()
+            self.wait_paused(new_id)
+
+            # Let the pre-admission 200 land only now (after admission);
+            # the gate resets on vacate so it can be re-armed.
+            self.release(gates, "/api/pauses")
+            t_old200.join(timeout=10)
+            self.assertFalse(t_old200.is_alive())
+
+            # After admission the same old id is expired: its 409 reply is
+            # generated now and also held back.
+            self.arm(gates, "/api/pauses")
+            t_old409, r_old409 = self.call_in_thread(
+                appmod.app.test_client(), "GET",
+                f"/api/pauses?run_id={old_id}", "/api/pauses", gates)
+            self.wait_entered(gates, "/api/pauses")
+
+            # A rejected /api/run (active conflict) whose 409 is also slow:
+            # rejecting it must leave the admitted new run untouched.
+            self.arm(gates, "/api/run")
+            t_run, r_run = self.call_in_thread(
+                appmod.app.test_client(), "POST", "/api/run", "/api/run",
+                gates, json_body={"code": SIMPLE_CODE})
+            self.wait_entered(gates, "/api/run")
+            # The rejection clears nothing: history and current run intact.
+            self.assertEqual(self.state()["run_id"], new_id)
+
+            self.release(gates, "/api/pauses")
+            self.release(gates, "/api/run")
+            t_old409.join(timeout=10)
+            t_run.join(timeout=10)
+            self.assertFalse(t_old409.is_alive() or t_run.is_alive())
+
+        # The pre-admission reply stays a 200 but self-describes as the OLD
+        # run (dropped by the frontend guard); the post-admission request
+        # gets the unchanged 409 contract.
+        self.assertEqual(r_old200["status"], 200)
+        self.assertEqual(r_old200["body"]["run_id"], old_id)
+        self.assertEqual(
+            [p["pause_seq"] for p in r_old200["body"]["pauses"]],
+            [p["pause_seq"] for p in old_pauses])
+        self.assertEqual(r_old409["status"], 409)
+        self.assertEqual(r_run["status"], 409)
+        snap = self.state()
+        self.assertEqual(snap["run_id"], new_id)
+        self.assertEqual(snap["status"], "paused")
+        self.cleanup_run(new_id)
+
+    # ---- parked replies never hold COND: live controls still flow -------
+
+    def test_parked_old_reply_never_blocks_new_run_controls(self):
+        old_id = self.start_run()
+        self.wait_paused(old_id)
+
+        gates = self._make_gates(["/api/pauses"])
+        client = appmod.app.test_client()
+        with self.gated_jsonify(gates):
+            self.arm(gates, "/api/pauses")
+            t, result = self.call_in_thread(
+                client, "GET", f"/api/pauses?run_id={old_id}",
+                "/api/pauses", gates)
+            self.wait_entered(gates, "/api/pauses")
+
+            # Even before the admission, unrelated requests must not queue
+            # behind COND while a reply is parked: state answers and an
+            # accepted step goes through immediately...
+            step = self.client.post(
+                "/api/step", json={"run_id": old_id, "pause_seq": 1})
+            self.assertEqual(step.status_code, 200)
+            # ...and the duplicate for the now-consumed pause is rejected
+            # with 409 right away.
+            dup = self.client.post(
+                "/api/step", json={"run_id": old_id, "pause_seq": 1})
+            self.assertEqual(dup.status_code, 409)
+
+            self.assertEqual(
+                self.client.post(
+                    "/api/terminate", json={"run_id": old_id}).status_code, 200)
+            new_id = self.start_run()
+            self.wait_paused(new_id)
+            seq = self.state()["pause_seq"]
+
+            # New run's normal controls work while the old reply is parked:
+            # step advances and a fresh pause snapshot appears.
+            ok = self.client.post(
+                "/api/step", json={"run_id": new_id, "pause_seq": seq})
+            self.assertEqual(ok.status_code, 200)
+            self.assertTrue(wait_for(
+                lambda: self.state()["run_id"] == new_id
+                and self.state()["status"] == "paused"
+                and self.state()["pause_seq"] == seq + 1))
+
+            self.release(gates, "/api/pauses")
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["body"]["run_id"], old_id)
+        self.assertEqual(self.state()["run_id"], new_id)
+        self.cleanup_run(new_id)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required for the JS frontend race checks")
+class FrontendAsyncChainTests(unittest.TestCase):
+    """Runs the controllable-fetch browser regression (test_frontend_races.js)
+    against the REAL static/app.js: two overlapping old poll chains, late old
+    control/run responses and the current run's own features. The harness
+    exits non-zero on any failed assertion."""
+
+    def test_frontend_cross_run_async_chain(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(here, "test_frontend_races.js")
+        proc = subprocess.run(
+            ["node", script], cwd=here,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if proc.returncode != 0:
+            self.fail(
+                f"frontend race harness exited {proc.returncode}:\n"
+                + proc.stdout)
 
 
 if __name__ == "__main__":

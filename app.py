@@ -232,6 +232,11 @@ def api_run():
     if line_count > MAX_LINES:
         return jsonify({"error": f"代码最多 {MAX_LINES} 行（当前 {line_count} 行）"}), 400
 
+    # Admission and rejection decisions are resolved inside COND; every
+    # response is serialised outside the lock so a delayed/slow reply (a
+    # test gate, a slow client) can never hold COND and block state polling
+    # or the lifecycle coordination for other requests.
+    rejected = None  # (payload, status_code) for a rejected startup
     with COND:
         # An active run (including one still starting up) conflicts. A
         # terminal run whose child is not reaped yet must finish reaping
@@ -249,15 +254,23 @@ def api_run():
             if old is None:
                 break  # no run yet: the slot is free
             if old.status in ACTIVE_STATES:
-                return jsonify({"error": "已有未结束的运行，请先终止或等待其结束"}), 409
+                rejected = ({"error": "已有未结束的运行，请先终止或等待其结束"}, 409)
+                break
             if old.reaped:
                 break  # previous run terminal and reaped: the slot is free
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not _wait_reaped(old, timeout=remaining):
-                return jsonify({"error": "上一个运行的子进程尚未回收，请稍后重试"}), 409
+                rejected = ({"error": "上一个运行的子进程尚未回收，请稍后重试"}, 409)
+                break
 
-        run = Run(code)
-        CURRENT = run
+        if rejected is None:
+            run = Run(code)
+            CURRENT = run
+        else:
+            run = None
+
+    if rejected is not None:
+        return jsonify(rejected[0]), rejected[1]
 
     # Popen runs without the lock so a concurrent terminate (or another
     # failing system call) is never blocked behind process creation.
@@ -280,6 +293,7 @@ def api_run():
             COND.notify_all()
         return jsonify({"run_id": run.run_id})
 
+    terminate_won = False
     with COND:
         run.proc = proc
         run.proc_started = True
@@ -298,8 +312,12 @@ def api_run():
             run.reaped = True
             run.status = "terminated"
             COND.notify_all()
-            return jsonify({"run_id": run.run_id})
-        threading.Thread(target=reader_thread, args=(run,), daemon=True).start()
+            terminate_won = True
+        else:
+            threading.Thread(target=reader_thread, args=(run,), daemon=True).start()
+
+    if terminate_won:
+        return jsonify({"run_id": run.run_id})
 
     try:
         proc.stdin.write(json.dumps({"code": code}) + "\n")
@@ -323,17 +341,25 @@ def _step_or_continue(command):
     data = request.get_json(force=True, silent=True) or {}
     run_id = data.get("run_id")
     pause_seq = data.get("pause_seq")
+    # Decide the outcome (and perform the pipe write) while the reply is
+    # serialised outside the lock: response construction is kept out of the
+    # COND critical section so a deliberately delayed reply can never block
+    # termination/event application for other threads.
     with COND:
         run = CURRENT
         if run is None or run.run_id != run_id:
-            return jsonify({"error": "运行不存在或已过期"}), 409
-        if run.status != "paused":
-            return jsonify({"error": "当前不在暂停状态，请求被拒绝"}), 409
-        if pause_seq != run.pause_seq or run.pause_consumed:
-            return jsonify({"error": "重复或过期的请求，已拒绝且未推进"}), 409
-        run.pause_consumed = True
-        run.status = "running"
-        proc = run.proc
+            payload, status_code = {"error": "运行不存在或已过期"}, 409
+        elif run.status != "paused":
+            payload, status_code = {"error": "当前不在暂停状态，请求被拒绝"}, 409
+        elif pause_seq != run.pause_seq or run.pause_consumed:
+            payload, status_code = {"error": "重复或过期的请求，已拒绝且未推进"}, 409
+        else:
+            run.pause_consumed = True
+            run.status = "running"
+            proc = run.proc
+            payload, status_code = None, 200
+    if status_code != 200:
+        return jsonify(payload), status_code
     try:
         proc.stdin.write(json.dumps({"cmd": command}) + "\n")
         proc.stdin.flush()
@@ -359,24 +385,31 @@ def api_continue():
 def api_terminate():
     data = request.get_json(force=True, silent=True) or {}
     run_id = data.get("run_id")
+    # Resolve the outcome inside COND; the reply is serialised outside the
+    # lock so a delayed response cannot block the run/reaper coordination.
     with COND:
         run = CURRENT
         if run is None or run.run_id != run_id:
-            return jsonify({"error": "运行不存在或已过期"}), 409
-        if run.status not in ACTIVE_STATES:
+            payload, status_code = {"error": "运行不存在或已过期"}, 409
+        elif run.status not in ACTIVE_STATES:
             # Terminal (finished/exception/terminated): stale request.
-            return jsonify({"error": "运行不存在或已过期"}), 409
-        # Terminal state is sticky and set before killing: any event the
-        # reader still drains from the pipe is now a late event and is
-        # discarded by _apply_event.
-        run.status = "terminated"
-        run.terminate_requested = True
-        if not run.proc_started:
-            # Startup is still inside Popen; the starter performs the
-            # kill/reap itself as soon as the handle exists, and wakes us.
-            COND.wait_for(lambda: run.proc_started or run.reaped)
-        proc = run.proc  # set by the starter; None only if Popen failed
-        needs_reap = not run.reaped
+            payload, status_code = {"error": "运行不存在或已过期"}, 409
+        else:
+            payload, status_code = None, 200
+            # Terminal state is sticky and set before killing: any event the
+            # reader still drains from the pipe is now a late event and is
+            # discarded by _apply_event.
+            run.status = "terminated"
+            run.terminate_requested = True
+            if not run.proc_started:
+                # Startup is still inside Popen; the starter performs the
+                # kill/reap itself as soon as the handle exists, and wakes us.
+                COND.wait_for(lambda: run.proc_started or run.reaped)
+            proc = run.proc  # set by the starter; None only if Popen failed
+            needs_reap = not run.reaped
+
+    if status_code != 200:
+        return jsonify(payload), status_code
 
     if proc is not None:
         # Kill outside the lock; the reader performs the normal wait() and
@@ -405,10 +438,15 @@ def api_terminate():
 
 @app.get("/api/state")
 def api_state():
+    # Snapshot under the lock; the response is built outside so delaying its
+    # delivery (tests interleave admissions with an in-flight reply) never
+    # blocks run lifecycle transitions.
     with COND:
         if CURRENT is None:
-            return jsonify({"status": "idle", "run_id": None})
-        return jsonify(CURRENT.snapshot())
+            payload = {"status": "idle", "run_id": None}
+        else:
+            payload = CURRENT.snapshot()
+    return jsonify(payload)
 
 
 @app.get("/api/pauses")
@@ -418,16 +456,23 @@ def api_pauses():
     Read-only replay: this never touches run status and never advances the
     child. A missing/unknown run_id (including one replaced by a newer run
     or cleared when that newer run was admitted) is 409. Snapshots are
-    returned as deep copies so a concurrent pause cannot mutate a reply.
+    returned as deep copies so a concurrent pause cannot mutate a reply; the
+    copies are made under the lock and the response is serialised outside it,
+    so a reply already produced (200) but delayed across a new admission
+    still carries exactly the old run's id and snapshots.
     """
     run_id = request.args.get("run_id")
     with COND:
         if CURRENT is None or not run_id or CURRENT.run_id != run_id:
-            return jsonify({"error": "运行不存在或已过期"}), 409
-        return jsonify({
-            "run_id": CURRENT.run_id,
-            "pauses": [dict(p, locals=dict(p["locals"])) for p in CURRENT.pauses],
-        })
+            payload, status_code = {"error": "运行不存在或已过期"}, 409
+        else:
+            payload = {
+                "run_id": CURRENT.run_id,
+                "pauses": [dict(p, locals=dict(p["locals"]))
+                           for p in CURRENT.pauses],
+            }
+            status_code = 200
+    return jsonify(payload), status_code
 
 
 if __name__ == "__main__":
